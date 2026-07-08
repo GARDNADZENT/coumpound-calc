@@ -1,0 +1,27 @@
+kind = "web"
+previewPath = "/"
+title = "Compound Trading Calculator"
+version = "1.0.0"
+id = "artifacts/compound-calculator"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 20453
+
+[services.development]
+run = "pnpm --filter @workspace/compound-calculator run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/compound-calculator", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/compound-calculator/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "20453"
+BASE_PATH = "/"
