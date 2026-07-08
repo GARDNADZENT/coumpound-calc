@@ -108,19 +108,32 @@ export class DerivAPIClient {
       const url = `${WS_BASE}?app_id=${encodeURIComponent(appId)}`;
       this.ws = new WebSocket(url);
 
+      let settled = false;
+      const fail = (msg: string) => {
+        if (settled) return;
+        settled = true;
+        reject(new Error(msg));
+      };
+
       this.ws.onopen = () => {
+        settled = true;
         resolve();
       };
 
       this.ws.onerror = () => {
-        reject(new Error('WebSocket connection failed. Check your App ID is correct.'));
+        // onerror gives no detail; wait for onclose which has the code/reason
       };
 
       this.ws.onclose = (ev) => {
         this.setStatus('disconnected');
-        const closeMsg = ev.reason ? ` (${ev.reason})` : '';
+        const detail = ev.reason
+          ? `${ev.reason} (code ${ev.code})`
+          : ev.code
+          ? `close code ${ev.code}`
+          : 'connection refused';
+        fail(`WebSocket failed: ${detail}. Make sure your App ID is a valid registered Deriv app.`);
         for (const [, p] of this.pendingRequests) {
-          p.reject(new Error(`Connection closed${closeMsg}`));
+          p.reject(new Error(`Connection closed: ${detail}`));
         }
         this.pendingRequests.clear();
       };

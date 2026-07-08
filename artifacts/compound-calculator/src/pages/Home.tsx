@@ -49,7 +49,7 @@ export default function Home() {
   const [newDepositDay, setNewDepositDay] = useState('');
   const [newDepositAmount, setNewDepositAmount] = useState('');
   const [tokenInput, setTokenInput] = useState('');
-  const [appIdInput, setAppIdInput] = useState('');
+  const [appIdInput, setAppIdInput] = useState('36544');
   const [showToken, setShowToken] = useState(false);
   const [showTrades, setShowTrades] = useState(true);
 
@@ -342,11 +342,11 @@ export default function Home() {
                             data-testid="input-deriv-app-id"
                           />
                           <p className="text-[10px] text-muted-foreground/50">
-                            From{' '}
+                            <strong>36544</strong> is Deriv's public demo ID — works for testing.
+                            For production, register your own at{' '}
                             <a href="https://developers.deriv.com" target="_blank" rel="noopener noreferrer" className="underline hover:text-muted-foreground">
                               developers.deriv.com
-                            </a>
-                            {' '}→ Register app (PAT type) → copy App ID.
+                            </a>.
                           </p>
                         </div>
 
