@@ -49,6 +49,7 @@ export default function Home() {
   const [newDepositDay, setNewDepositDay] = useState('');
   const [newDepositAmount, setNewDepositAmount] = useState('');
   const [tokenInput, setTokenInput] = useState('');
+  const [appIdInput, setAppIdInput] = useState('');
   const [showToken, setShowToken] = useState(false);
   const [showTrades, setShowTrades] = useState(true);
 
@@ -66,18 +67,20 @@ export default function Home() {
 
   const handleConnectDeriv = () => {
     const t = tokenInput.trim();
-    if (!t) return;
-    // Don't clear input yet — keep it visible so the user can retry on failure.
-    // We clear it below once status flips to 'authorized'.
-    deriv.connect(t);
+    const a = appIdInput.trim();
+    if (!t || !a) return;
+    // Keep inputs visible so the user can retry on failure.
+    // Cleared below once status flips to 'authorized'.
+    deriv.connect(t, a);
   };
 
-  // Clear the token input once successfully authorized.
+  // Clear inputs once successfully authorized.
   const prevStatus = useRef(deriv.status);
   if (prevStatus.current !== deriv.status) {
     prevStatus.current = deriv.status;
-    if (deriv.status === 'authorized' && tokenInput) {
-      setTokenInput('');
+    if (deriv.status === 'authorized') {
+      if (tokenInput) setTokenInput('');
+      if (appIdInput) setAppIdInput('');
     }
   }
 
@@ -177,10 +180,6 @@ export default function Home() {
                         <span className="text-xs font-mono font-medium">{deriv.accountInfo.loginid}</span>
                       </div>
                       <div className="flex justify-between items-center">
-                        <span className="text-xs text-muted-foreground">Name</span>
-                        <span className="text-xs font-medium truncate max-w-[140px]">{deriv.accountInfo.fullname || deriv.accountInfo.email}</span>
-                      </div>
-                      <div className="flex justify-between items-center">
                         <span className="text-xs text-muted-foreground">Type</span>
                         <Badge variant="outline" className="text-xs py-0 h-5">
                           {deriv.accountInfo.is_virtual ? 'Demo' : 'Real'}
@@ -269,20 +268,20 @@ export default function Home() {
                         <span>
                           <span className="font-medium block mb-0.5">Connection failed</span>
                           {deriv.error}
-                          {deriv.savedToken && (
+                          {deriv.savedPat && (
                             <button
                               className="block mt-1 underline text-muted-foreground hover:text-foreground"
-                              onClick={deriv.clearSavedToken}
+                              onClick={deriv.clearSavedCredentials}
                             >
-                              Clear saved token
+                              Clear saved credentials
                             </button>
                           )}
                         </span>
                       </div>
-                    ) : deriv.savedToken && deriv.status === 'connecting' ? (
+                    ) : deriv.savedPat && deriv.status === 'connecting' ? (
                       <div className="rounded-md border border-border/30 bg-muted/20 p-3 text-xs text-muted-foreground flex items-center gap-2">
                         <RefreshCw size={12} className="animate-spin shrink-0" />
-                        Reconnecting with saved token…
+                        Reconnecting with saved credentials…
                       </div>
                     ) : null}
 
@@ -292,50 +291,76 @@ export default function Home() {
                         Connecting…
                       </div>
                     ) : (
-                      <div className="space-y-2">
-                        <Label htmlFor="deriv-token" className="text-xs text-muted-foreground uppercase tracking-wider">
-                          Deriv API Token
-                        </Label>
-                        <div className="relative">
-                          <Input
-                            id="deriv-token"
-                            type={showToken ? 'text' : 'password'}
-                            placeholder="Paste your API token…"
-                            className="pr-10 font-mono text-sm bg-background/50"
-                            value={tokenInput}
-                            onChange={(e) => setTokenInput(e.target.value)}
-                            onKeyDown={(e) => { if (e.key === 'Enter') handleConnectDeriv(); }}
-                            data-testid="input-deriv-token"
-                          />
-                          <button
-                            type="button"
-                            className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-                            onClick={() => setShowToken((v) => !v)}
-                            tabIndex={-1}
-                          >
-                            {showToken ? <EyeOff size={14} /> : <Eye size={14} />}
-                          </button>
+                      <div className="space-y-3">
+                        {/* PAT Token */}
+                        <div className="space-y-1.5">
+                          <Label htmlFor="deriv-token" className="text-xs text-muted-foreground uppercase tracking-wider">
+                            Personal Access Token
+                          </Label>
+                          <div className="relative">
+                            <Input
+                              id="deriv-token"
+                              type={showToken ? 'text' : 'password'}
+                              placeholder="pat_xxxxxxxxxxxxxxxx…"
+                              className="pr-10 font-mono text-sm bg-background/50"
+                              value={tokenInput}
+                              onChange={(e) => setTokenInput(e.target.value)}
+                              onKeyDown={(e) => { if (e.key === 'Enter') handleConnectDeriv(); }}
+                              data-testid="input-deriv-token"
+                            />
+                            <button
+                              type="button"
+                              className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                              onClick={() => setShowToken((v) => !v)}
+                              tabIndex={-1}
+                            >
+                              {showToken ? <EyeOff size={14} /> : <Eye size={14} />}
+                            </button>
+                          </div>
+                          <p className="text-[10px] text-muted-foreground/50">
+                            From{' '}
+                            <a href="https://home.deriv.com/dashboard/api-tokens" target="_blank" rel="noopener noreferrer" className="underline hover:text-muted-foreground">
+                              home.deriv.com → API Tokens
+                            </a>
+                            {' '}— select <strong>Trade</strong> scope.
+                          </p>
                         </div>
+
+                        {/* App ID */}
+                        <div className="space-y-1.5">
+                          <Label htmlFor="deriv-app-id" className="text-xs text-muted-foreground uppercase tracking-wider">
+                            App ID
+                          </Label>
+                          <Input
+                            id="deriv-app-id"
+                            type="text"
+                            placeholder="e.g. a1b2c3d4"
+                            className="font-mono text-sm bg-background/50"
+                            value={appIdInput}
+                            onChange={(e) => setAppIdInput(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === 'Enter') handleConnectDeriv(); }}
+                            data-testid="input-deriv-app-id"
+                          />
+                          <p className="text-[10px] text-muted-foreground/50">
+                            From{' '}
+                            <a href="https://developers.deriv.com" target="_blank" rel="noopener noreferrer" className="underline hover:text-muted-foreground">
+                              developers.deriv.com
+                            </a>
+                            {' '}→ Register app (PAT type) → copy App ID.
+                          </p>
+                        </div>
+
                         <Button
                           className="w-full gap-2 text-sm"
                           onClick={handleConnectDeriv}
-                          disabled={!tokenInput.trim()}
+                          disabled={!tokenInput.trim() || !appIdInput.trim()}
                           data-testid="button-connect-deriv"
                         >
                           <Wifi size={14} />
                           Connect to Deriv
                         </Button>
-                        <p className="text-[10px] text-muted-foreground/60 leading-relaxed">
-                          Get your token at{' '}
-                          <a
-                            href="https://app.deriv.com/account/api-token"
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="underline hover:text-muted-foreground"
-                          >
-                            app.deriv.com/account/api-token
-                          </a>
-                          . Only Read scope is needed. Your token is saved locally in your browser.
+                        <p className="text-[10px] text-muted-foreground/40 leading-relaxed">
+                          Credentials are saved locally in your browser only.
                         </p>
                       </div>
                     )}
