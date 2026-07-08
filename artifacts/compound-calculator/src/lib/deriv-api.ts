@@ -1,22 +1,21 @@
 /**
- * Deriv API client — new platform (home.deriv.com)
+ * Deriv API client — WebSocket API (ws.derivws.com)
  *
  * Auth flow:
- *   1. REST  GET  /trading/v1/options/accounts           → list accounts
- *   2. REST  POST /trading/v1/options/accounts/{id}/otp  → get WS URL
- *   3. WS    connect to that URL (OTP embedded)
- *   4. WS    subscribe balance, profit_table, transactions (same protocol)
+ *   1. Connect to wss://ws.derivws.com/websockets/v3?app_id={appId}
+ *   2. Send { authorize: patToken }  → receive account info
+ *   3. Subscribe balance, transactions; query profit_table
  *
- * Docs: https://developers.deriv.com/docs/intro/api-overview/
+ * Docs: https://api.deriv.com/
  */
 
-const REST_BASE = 'https://api.derivws.com';
+const WS_BASE = 'wss://ws.derivws.com/websockets/v3';
 
 type MessageHandler = (data: DerivMessage) => void;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type DerivMessage = Record<string, any>;
 
-// ─── Public types ────────────────────────────────────────────────────────────
+// ─── Public types ─────────────────────────────────────────────────────────────
 
 export interface OptionsAccount {
   account_id: string;
@@ -24,15 +23,15 @@ export interface OptionsAccount {
   currency: string;
   balance?: number;
   is_disabled?: boolean;
-  // The API may also return 'id' depending on version — we normalise below.
-  id?: string;
 }
 
 export interface DerivAccountInfo {
-  loginid: string;     // account_id
+  loginid: string;
   currency: string;
-  is_virtual: boolean; // true for demo
+  is_virtual: boolean;
   account_type: 'demo' | 'real';
+  fullname?: string;
+  email?: string;
 }
 
 export interface DerivBalance {
@@ -76,54 +75,6 @@ export interface DerivTransaction {
 
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'authorized' | 'error';
 
-// ─── REST helpers ─────────────────────────────────────────────────────────────
-
-async function restGet<T>(
-  path: string,
-  patToken: string,
-  appId: string,
-): Promise<T> {
-  const res = await fetch(`${REST_BASE}${path}`, {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${patToken}`,
-      'Deriv-App-ID': appId,
-      'Content-Type': 'application/json',
-    },
-  });
-  const json = await res.json() as Record<string, unknown>;
-  if (!res.ok) {
-    const errors = (json.errors as Array<{ message: string }> | undefined) ?? [];
-    const msg = errors[0]?.message ?? `HTTP ${res.status}`;
-    throw new Error(msg);
-  }
-  return json as T;
-}
-
-async function restPost<T>(
-  path: string,
-  patToken: string,
-  appId: string,
-  body?: unknown,
-): Promise<T> {
-  const res = await fetch(`${REST_BASE}${path}`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${patToken}`,
-      'Deriv-App-ID': appId,
-      'Content-Type': 'application/json',
-    },
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
-  const json = await res.json() as Record<string, unknown>;
-  if (!res.ok) {
-    const errors = (json.errors as Array<{ message: string }> | undefined) ?? [];
-    const msg = errors[0]?.message ?? `HTTP ${res.status}`;
-    throw new Error(msg);
-  }
-  return json as T;
-}
-
 // ─── Client class ─────────────────────────────────────────────────────────────
 
 export class DerivAPIClient {
@@ -148,59 +99,28 @@ export class DerivAPIClient {
     this.statusHandler?.(status);
   }
 
-  // ── REST: list all Options accounts ────────────────────────────────────────
+  // ── Connect + Authorize ─────────────────────────────────────────────────────
 
-  async getAccounts(
-    patToken: string,
-    appId: string,
-  ): Promise<OptionsAccount[]> {
-    const res = await restGet<{ data: OptionsAccount[] }>(
-      '/trading/v1/options/accounts',
-      patToken,
-      appId,
-    );
-    // Normalise: some API versions may return 'id' instead of 'account_id'.
-    return (res.data ?? []).map((a) => ({
-      ...a,
-      account_id: a.account_id ?? (a.id as string),
-    }));
-  }
-
-  // ── REST: get a short-lived OTP WebSocket URL ────────────────────────────
-
-  async getOTPWebSocketUrl(
-    patToken: string,
-    appId: string,
-    accountId: string,
-  ): Promise<string> {
-    const res = await restPost<{ data: { url: string } }>(
-      `/trading/v1/options/accounts/${accountId}/otp`,
-      patToken,
-      appId,
-    );
-    return res.data.url;
-  }
-
-  // ── WebSocket: connect using the OTP URL ────────────────────────────────
-
-  connect(wsUrl: string): Promise<void> {
+  connect(appId: string): Promise<void> {
     return new Promise((resolve, reject) => {
       this.setStatus('connecting');
-      this.ws = new WebSocket(wsUrl);
+
+      const url = `${WS_BASE}?app_id=${encodeURIComponent(appId)}`;
+      this.ws = new WebSocket(url);
 
       this.ws.onopen = () => {
-        this.setStatus('authorized'); // authenticated by OTP — skip old authorize step
         resolve();
       };
 
       this.ws.onerror = () => {
-        reject(new Error('WebSocket connection failed'));
+        reject(new Error('WebSocket connection failed. Check your App ID is correct.'));
       };
 
-      this.ws.onclose = () => {
+      this.ws.onclose = (ev) => {
         this.setStatus('disconnected');
+        const closeMsg = ev.reason ? ` (${ev.reason})` : '';
         for (const [, p] of this.pendingRequests) {
-          p.reject(new Error('Connection closed'));
+          p.reject(new Error(`Connection closed${closeMsg}`));
         }
         this.pendingRequests.clear();
       };
@@ -233,6 +153,13 @@ export class DerivAPIClient {
     });
   }
 
+  async authorize(token: string): Promise<DerivMessage> {
+    const res = await this.send({ authorize: token });
+    if (res.error) throw new Error(res.error.message as string);
+    this.setStatus('authorized');
+    return res.authorize as DerivMessage;
+  }
+
   private send(payload: DerivMessage): Promise<DerivMessage> {
     return new Promise((resolve, reject) => {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
@@ -253,7 +180,7 @@ export class DerivAPIClient {
     this.subscriptionHandlers.get(msgType)!.push(handler);
   }
 
-  // ── WebSocket: balance ───────────────────────────────────────────────────
+  // ── Balance ──────────────────────────────────────────────────────────────────
 
   async getBalance(): Promise<DerivBalance> {
     const res = await this.send({ balance: 1 });
@@ -267,7 +194,7 @@ export class DerivAPIClient {
     this.send({ balance: 1, subscribe: 1 }).catch(() => {/* ignore */});
   }
 
-  // ── WebSocket: transactions ──────────────────────────────────────────────
+  // ── Transactions ─────────────────────────────────────────────────────────────
 
   subscribeTransactions(handler: (tx: DerivTransaction) => void): void {
     this.addSubscriptionHandler('transaction', (msg) => {
@@ -276,7 +203,7 @@ export class DerivAPIClient {
     this.send({ transaction: 1, subscribe: 1 }).catch(() => {/* ignore */});
   }
 
-  // ── WebSocket: profit table ──────────────────────────────────────────────
+  // ── Profit table ─────────────────────────────────────────────────────────────
 
   async getProfitTable(limit = 50): Promise<DerivTrade[]> {
     const res = await this.send({
@@ -288,7 +215,7 @@ export class DerivAPIClient {
     return ((res.profit_table?.transactions as DerivTrade[]) ?? []);
   }
 
-  // ── Teardown ─────────────────────────────────────────────────────────────
+  // ── Teardown ─────────────────────────────────────────────────────────────────
 
   disconnect() {
     for (const [, p] of this.pendingRequests) {
