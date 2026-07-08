@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import { useCalculator } from '@/hooks/use-calculator';
 import { useDerivAccount } from '@/hooks/use-deriv-account';
 import { formatCurrency, formatPercentage } from '@/lib/utils';
@@ -67,9 +67,19 @@ export default function Home() {
   const handleConnectDeriv = () => {
     const t = tokenInput.trim();
     if (!t) return;
+    // Don't clear input yet — keep it visible so the user can retry on failure.
+    // We clear it below once status flips to 'authorized'.
     deriv.connect(t);
-    setTokenInput('');
   };
+
+  // Clear the token input once successfully authorized.
+  const prevStatus = useRef(deriv.status);
+  if (prevStatus.current !== deriv.status) {
+    prevStatus.current = deriv.status;
+    if (deriv.status === 'authorized' && tokenInput) {
+      setTokenInput('');
+    }
+  }
 
   const handleSyncBalance = () => {
     if (deriv.balance != null) {
@@ -253,12 +263,13 @@ export default function Home() {
                 ) : (
                   /* Disconnected / error state */
                   <div className="space-y-3">
-                    {deriv.savedToken && deriv.status !== 'connecting' ? (
-                      <div className="rounded-md border border-amber-500/20 bg-amber-500/5 p-3 text-xs text-amber-400 flex items-start gap-2">
-                        <span className="shrink-0 mt-0.5">⚠</span>
+                    {deriv.status === 'error' && deriv.error ? (
+                      <div className="rounded-md border border-red-500/20 bg-red-500/5 p-3 text-xs text-red-400 flex items-start gap-2">
+                        <span className="shrink-0 mt-0.5">✕</span>
                         <span>
-                          {deriv.error ?? 'Reconnecting with saved token…'}
-                          {deriv.error && (
+                          <span className="font-medium block mb-0.5">Connection failed</span>
+                          {deriv.error}
+                          {deriv.savedToken && (
                             <button
                               className="block mt-1 underline text-muted-foreground hover:text-foreground"
                               onClick={deriv.clearSavedToken}
@@ -267,6 +278,11 @@ export default function Home() {
                             </button>
                           )}
                         </span>
+                      </div>
+                    ) : deriv.savedToken && deriv.status === 'connecting' ? (
+                      <div className="rounded-md border border-border/30 bg-muted/20 p-3 text-xs text-muted-foreground flex items-center gap-2">
+                        <RefreshCw size={12} className="animate-spin shrink-0" />
+                        Reconnecting with saved token…
                       </div>
                     ) : null}
 

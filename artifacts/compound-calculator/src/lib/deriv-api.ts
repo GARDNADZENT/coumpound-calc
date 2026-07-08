@@ -200,9 +200,21 @@ export class DerivAPIClient {
   }
 
   disconnect() {
-    this.ws?.close();
-    this.ws = null;
+    // Reject all in-flight requests before closing so callers never hang.
+    for (const [, pending] of this.pendingRequests) {
+      pending.reject(new Error('Disconnected'));
+    }
     this.pendingRequests.clear();
     this.subscriptionHandlers.clear();
+    // Remove lifecycle handlers so onclose doesn't fire state changes after
+    // the client is intentionally torn down.
+    if (this.ws) {
+      this.ws.onopen = null;
+      this.ws.onclose = null;
+      this.ws.onerror = null;
+      this.ws.onmessage = null;
+      this.ws.close();
+      this.ws = null;
+    }
   }
 }

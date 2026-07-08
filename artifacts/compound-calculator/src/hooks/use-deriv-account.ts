@@ -30,6 +30,9 @@ export interface DerivAccountState {
 
 export function useDerivAccount() {
   const clientRef = useRef<DerivAPIClient | null>(null);
+  // Incremented on every new connect attempt; lets stale async branches
+  // detect they've been superseded and bail out without touching state.
+  const attemptRef = useRef(0);
 
   const [state, setState] = useState<DerivAccountState>({
     status: 'disconnected',
@@ -61,6 +64,11 @@ export function useDerivAccount() {
   };
 
   const connect = useCallback(async (token: string) => {
+    // Claim this attempt's ID; any older async branches that wake up later
+    // will see their ID is stale and bail out without touching state.
+    const attempt = ++attemptRef.current;
+    const isCurrentAttempt = () => attempt === attemptRef.current;
+
     // Clean up any existing connection
     clientRef.current?.disconnect();
 
@@ -68,20 +76,25 @@ export function useDerivAccount() {
     clientRef.current = client;
 
     client.onStatusChange((status) => {
+      if (!isCurrentAttempt()) return;
       setState((prev) => ({ ...prev, status, error: status === 'error' ? 'Connection failed' : prev.error }));
     });
 
-    setState((prev) => ({ ...prev, error: null }));
+    setState((prev) => ({ ...prev, error: null, status: 'connecting' }));
 
     try {
       await client.connect();
-      const accountInfo = await client.authorize(token);
+      if (!isCurrentAttempt()) return;
 
-      // Save token after successful auth
+      const accountInfo = await client.authorize(token);
+      if (!isCurrentAttempt()) return;
+
+      // Save token only after successful auth
       localStorage.setItem(TOKEN_STORAGE_KEY, token);
 
       // Get initial balance
       const balanceData = await client.getBalance();
+      if (!isCurrentAttempt()) return;
 
       // Get recent trades (profit table)
       let recentTrades: DerivTrade[] = [];
@@ -90,6 +103,7 @@ export function useDerivAccount() {
       } catch {
         // profit table may not be available on virtual accounts
       }
+      if (!isCurrentAttempt()) return;
 
       const todayPnL = computeTodayPnL(recentTrades);
 
@@ -106,6 +120,7 @@ export function useDerivAccount() {
 
       // Subscribe to live balance updates
       client.subscribeBalance((bal) => {
+        if (!isCurrentAttempt()) return;
         setState((prev) => ({
           ...prev,
           balance: bal.balance,
@@ -115,6 +130,7 @@ export function useDerivAccount() {
 
       // Subscribe to live transactions
       client.subscribeTransactions((tx) => {
+        if (!isCurrentAttempt()) return;
         setState((prev) => {
           const updated = [tx, ...prev.recentTransactions].slice(0, 100);
           return { ...prev, recentTransactions: updated };
@@ -122,6 +138,7 @@ export function useDerivAccount() {
 
         // Refresh profit table to get updated trade data
         client.getProfitTable(100).then((trades) => {
+          if (!isCurrentAttempt()) return;
           setState((prev) => ({
             ...prev,
             recentTrades: trades,
@@ -130,6 +147,9 @@ export function useDerivAccount() {
         }).catch(() => {/* ignore */});
       });
     } catch (err) {
+      if (!isCurrentAttempt()) return;
+      // Close the socket on auth failure — no need to keep it open.
+      client.disconnect();
       const msg = err instanceof Error ? err.message : 'Connection failed';
       setState((prev) => ({ ...prev, status: 'error', error: msg }));
     }
