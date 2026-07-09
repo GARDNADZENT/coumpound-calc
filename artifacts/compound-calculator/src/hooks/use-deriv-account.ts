@@ -73,7 +73,7 @@ export function useDerivAccount() {
 
   const [state, setState] = useState<DerivAccountState>(INITIAL_STATE);
 
-  const connect = useCallback(async (patToken: string, appId: string) => {
+  const connect = useCallback(async (patToken: string, appId: string, accountId?: string) => {
     const attempt = ++attemptRef.current;
     const current = () => attempt === attemptRef.current;
 
@@ -96,45 +96,52 @@ export function useDerivAccount() {
     setState((prev) => ({ ...prev, error: null, status: 'connecting' }));
 
     try {
-      // ── Step 1: open WebSocket ────────────────────────────────────────────
-      await client.connect(appId);
+      // ── Step 1: list accounts via REST ────────────────────────────────────
+      const accounts = await client.getAccounts(patToken, appId);
       if (!current()) return;
 
-      setState((prev) => ({ ...prev, status: 'connected' }));
+      if (accounts.length === 0) {
+        throw new Error('No Options trading accounts found for this token. Log in at home.deriv.com to get your default demo account.');
+      }
 
-      // ── Step 2: authorize with PAT token ─────────────────────────────────
-      const authData = await client.authorize(patToken);
+      const activeAccounts = accounts.filter((a) => a.status === 'active');
+      if (activeAccounts.length === 0) {
+        throw new Error('No active Options trading accounts found for this token.');
+      }
+
+      // Explicit account requested (e.g. via switchAccount) — fail if it's missing or inactive.
+      if (accountId) {
+        const requested = activeAccounts.find((a) => a.account_id === accountId);
+        if (!requested) {
+          throw new Error(`Account ${accountId} is not available or inactive.`);
+        }
+      }
+
+      // Pick the requested account, or prefer real → demo among active accounts
+      const target =
+        (accountId ? activeAccounts.find((a) => a.account_id === accountId) : null) ??
+        activeAccounts.find((a) => a.account_type === 'real') ??
+        activeAccounts[0];
+
+      setState((prev) => ({ ...prev, accounts, selectedAccountId: target.account_id }));
+
+      // ── Step 2: get OTP WebSocket URL via REST ──────────────────────────────
+      const wsUrl = await client.getOTPWebSocketUrl(patToken, appId, target.account_id);
       if (!current()) return;
 
-      // Persist credentials after successful auth
+      // ── Step 3: connect to WebSocket (OTP already authenticates) ────────────
+      await client.connect(wsUrl);
+      if (!current()) return;
+
+      // Persist credentials after successful connection
       localStorage.setItem(PAT_KEY, patToken);
       localStorage.setItem(APP_ID_KEY, appId);
 
-      // Build accounts list from authorize response
-      const rawAccounts: Array<{
-        loginid: string;
-        currency: string;
-        is_disabled?: number;
-        is_virtual?: number;
-      }> = authData.account_list ?? [];
-
-      const accounts: OptionsAccount[] = rawAccounts.map((a) => ({
-        account_id: a.loginid,
-        account_type: a.is_virtual ? 'demo' : 'real',
-        currency: a.currency,
-        is_disabled: !!a.is_disabled,
-      }));
-
-      // selectedAccountId is always the account actually authorized
-      const authorizedId = authData.loginid as string;
-
-      setState((prev) => ({ ...prev, accounts, selectedAccountId: authorizedId }));
-
-      // ── Step 3: get initial balance ───────────────────────────────────────
+      // ── Step 4: get initial balance ───────────────────────────────────────────
       const balanceData = await client.getBalance();
       if (!current()) return;
 
-      // ── Step 4: get recent trades ─────────────────────────────────────────
+      // ── Step 5: get recent trades ─────────────────────────────────────────────
       let recentTrades: DerivTrade[] = [];
       try {
         recentTrades = await client.getProfitTable(100);
@@ -144,12 +151,10 @@ export function useDerivAccount() {
       if (!current()) return;
 
       const accountInfo: DerivAccountInfo = {
-        loginid: authorizedId,
-        currency: (authData.currency as string) ?? balanceData.currency,
-        is_virtual: !!(authData.is_virtual as number),
-        account_type: (authData.is_virtual ? 'demo' : 'real') as 'demo' | 'real',
-        fullname: authData.fullname as string | undefined,
-        email: authData.email as string | undefined,
+        loginid: target.account_id,
+        currency: target.currency ?? balanceData.currency,
+        is_virtual: target.account_type === 'demo',
+        account_type: target.account_type,
       };
 
       setState((prev) => ({
@@ -165,7 +170,7 @@ export function useDerivAccount() {
         error: null,
       }));
 
-      // ── Step 5: live subscriptions ────────────────────────────────────────
+      // ── Step 6: live subscriptions ─────────────────────────────────────────────
       client.subscribeBalance((bal) => {
         if (!current()) return;
         setState((prev) => ({ ...prev, balance: bal.balance, currency: bal.currency }));
@@ -195,6 +200,17 @@ export function useDerivAccount() {
       setState((prev) => ({ ...prev, status: 'error', error: msg }));
     }
   }, []);
+
+  const switchAccount = useCallback((accountId: string) => {
+    // Read current credentials from state without causing a state update side-effect.
+    setState((prev) => {
+      if (prev.savedPat && prev.savedAppId) {
+        // Schedule outside the updater to avoid side effects during render/commit.
+        queueMicrotask(() => connect(prev.savedPat!, prev.savedAppId!, accountId));
+      }
+      return prev;
+    });
+  }, [connect]);
 
   const disconnect = useCallback(() => {
     ++attemptRef.current; // invalidate any in-flight attempt
@@ -229,6 +245,7 @@ export function useDerivAccount() {
     ...state,
     connect,
     disconnect,
+    switchAccount,
     clearSavedCredentials,
   };
 }

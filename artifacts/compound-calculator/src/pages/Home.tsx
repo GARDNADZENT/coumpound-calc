@@ -49,7 +49,7 @@ export default function Home() {
   const [newDepositDay, setNewDepositDay] = useState('');
   const [newDepositAmount, setNewDepositAmount] = useState('');
   const [tokenInput, setTokenInput] = useState('');
-  const [appIdInput, setAppIdInput] = useState('33LOJY0qUuhITJM2jtIhR');
+  const [appIdInput, setAppIdInput] = useState('36544');
   const [showToken, setShowToken] = useState(false);
   const [showTrades, setShowTrades] = useState(true);
 
