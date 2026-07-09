@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import * as XLSX from 'xlsx';
 
 export interface Deposit {
@@ -15,6 +15,7 @@ export interface DayData {
   dollarProfitTarget: number;
   requiredPct: number;
   endBalance: number;
+  isLiveBalance: boolean;
 }
 
 export interface CalculatorState {
@@ -23,16 +24,54 @@ export interface CalculatorState {
   baseRate: number; // e.g. 20 for 20%
   currentDay: number;
   deposits: Deposit[];
+  startDate: Date;
 }
 
-export function useCalculator(initialState?: Partial<CalculatorState>) {
-  const [state, setState] = useState<CalculatorState>({
-    initialBalance: initialState?.initialBalance ?? 1000,
-    tradingDays: initialState?.tradingDays ?? 30,
-    baseRate: initialState?.baseRate ?? 20,
-    currentDay: initialState?.currentDay ?? 1,
-    deposits: initialState?.deposits ?? [],
+export interface LiveBalanceOverride {
+  day: number;
+  balance: number;
+}
+
+function startOfDay(d: Date): Date {
+  const copy = new Date(d);
+  copy.setHours(0, 0, 0, 0);
+  return copy;
+}
+
+/** Which cycle day corresponds to "today", given a fixed cycle start date. */
+export function computeAutoDay(startDate: Date, tradingDays: number): number {
+  const today = startOfDay(new Date());
+  const start = startOfDay(startDate);
+  const diffDays = Math.round((today.getTime() - start.getTime()) / 86_400_000);
+  return Math.max(1, Math.min(tradingDays, diffDays + 1));
+}
+
+const DEFAULT_START_DATE = new Date(2026, 6, 1); // July 1, 2026
+
+export function useCalculator(
+  initialState?: Partial<CalculatorState>,
+  /** Live Deriv account balance, if connected. Automatically rebase today's
+   *  actual starting balance onto this real figure instead of the theoretical
+   *  compounding chain, so the schedule reflects real progress. */
+  liveBalance?: number | null,
+) {
+  const [state, setState] = useState<CalculatorState>(() => {
+    const startDate = initialState?.startDate ?? DEFAULT_START_DATE;
+    const tradingDays = Math.max(1, Math.min(365, initialState?.tradingDays ?? 30));
+    return {
+      initialBalance: initialState?.initialBalance ?? 2,
+      tradingDays,
+      baseRate: initialState?.baseRate ?? 20,
+      currentDay: initialState?.currentDay ?? computeAutoDay(startDate, tradingDays),
+      deposits: initialState?.deposits ?? [],
+      startDate,
+    };
   });
+
+  // Track whether the user is following "today" automatically, or has manually
+  // pinned the viewer to a different day in the schedule.
+  const lastAutoDay = useRef(computeAutoDay(state.startDate, state.tradingDays));
+  const followingToday = useRef(true);
 
   const updateState = (updates: Partial<CalculatorState>) => {
     setState((prev) => {
@@ -43,9 +82,44 @@ export function useCalculator(initialState?: Partial<CalculatorState>) {
       next.currentDay = Math.max(1, Math.min(next.tradingDays, next.currentDay));
       // Remove deposits that fall outside the new tradingDays range
       next.deposits = next.deposits.filter((d) => d.day >= 1 && d.day <= next.tradingDays);
+
+      // A manual currentDay edit stops auto-follow — unless the value the user
+      // typed happens to equal today's real day, in which case follow stays on.
+      // This keeps the "Auto" badge/jump-button visibility consistent with
+      // whether midnight rollover will actually keep advancing the day.
+      if ('currentDay' in updates) {
+        const todaysDay = computeAutoDay(next.startDate, next.tradingDays);
+        followingToday.current = next.currentDay === todaysDay;
+        lastAutoDay.current = todaysDay;
+      }
+
       return next;
     });
   };
+
+  const jumpToToday = () => {
+    const day = computeAutoDay(state.startDate, state.tradingDays);
+    followingToday.current = true;
+    lastAutoDay.current = day;
+    setState((prev) => ({ ...prev, currentDay: day }));
+  };
+
+  // Auto-follow real calendar day: re-check periodically (covers a tab left open
+  // across midnight) and whenever the cycle length/start date changes.
+  useEffect(() => {
+    const sync = () => {
+      const day = computeAutoDay(state.startDate, state.tradingDays);
+      if (day !== lastAutoDay.current) {
+        lastAutoDay.current = day;
+        if (followingToday.current) {
+          setState((prev) => ({ ...prev, currentDay: day }));
+        }
+      }
+    };
+    sync();
+    const interval = setInterval(sync, 60_000);
+    return () => clearInterval(interval);
+  }, [state.startDate, state.tradingDays]);
 
   const addDeposit = (day: number, amount: number) => {
     const newDeposit: Deposit = {
@@ -66,10 +140,20 @@ export function useCalculator(initialState?: Partial<CalculatorState>) {
     }));
   };
 
+  const autoCurrentDay = useMemo(
+    () => computeAutoDay(state.startDate, state.tradingDays),
+    [state.startDate, state.tradingDays],
+  );
+
+  const liveBalanceOverride: LiveBalanceOverride | null = useMemo(
+    () => (liveBalance != null ? { day: autoCurrentDay, balance: liveBalance } : null),
+    [liveBalance, autoCurrentDay],
+  );
+
   const schedule = useMemo(() => {
-    const { initialBalance, tradingDays, baseRate, deposits } = state;
+    const { initialBalance, tradingDays, baseRate, deposits, startDate } = state;
     const rateDecimal = baseRate / 100;
-    
+
     // Group deposits by day for easy lookup
     const depositsByDay = deposits.reduce((acc, dep) => {
       acc[dep.day] = (acc[dep.day] || 0) + dep.amount;
@@ -77,21 +161,18 @@ export function useCalculator(initialState?: Partial<CalculatorState>) {
     }, {} as Record<number, number>);
 
     const scheduleData: DayData[] = [];
-    
-    // Use today as starting point for dates
-    const startDate = new Date();
-    startDate.setHours(0, 0, 0, 0);
+    const cycleStart = startOfDay(startDate);
 
     let actualEndPrev = 0;
 
     for (let i = 1; i <= tradingDays; i++) {
-      // 1. Calculate original target
+      // 1. Calculate original target (the ideal compounding curve)
       const originalStart = initialBalance * Math.pow(1 + rateDecimal, i - 1);
       const originalDollarProfit = originalStart * rateDecimal;
 
       // 2. Calculate actuals
       const depositToday = depositsByDay[i] || 0;
-      
+
       let actualStart;
       if (i === 1) {
         actualStart = initialBalance + depositToday;
@@ -99,11 +180,22 @@ export function useCalculator(initialState?: Partial<CalculatorState>) {
         actualStart = actualEndPrev + depositToday;
       }
 
+      // Rebase today's actual starting point on the live Deriv balance, so the
+      // rest of the schedule reflects real progress instead of the theoretical
+      // curve. Past days are left as originally projected (no historical feed).
+      // A deposit logged for today is treated as planned/not-yet-reflected in
+      // the live account, so it's added on top rather than discarded.
+      let isLiveBalance = false;
+      if (liveBalanceOverride && liveBalanceOverride.day === i) {
+        actualStart = liveBalanceOverride.balance + depositToday;
+        isLiveBalance = true;
+      }
+
       const requiredPct = actualStart > 0 ? (originalDollarProfit / actualStart) * 100 : 0;
       const actualEnd = actualStart + originalDollarProfit;
 
-      const currentDayDate = new Date(startDate);
-      currentDayDate.setDate(startDate.getDate() + (i - 1));
+      const currentDayDate = new Date(cycleStart);
+      currentDayDate.setDate(cycleStart.getDate() + (i - 1));
 
       scheduleData.push({
         day: i,
@@ -113,13 +205,22 @@ export function useCalculator(initialState?: Partial<CalculatorState>) {
         dollarProfitTarget: originalDollarProfit,
         requiredPct,
         endBalance: actualEnd,
+        isLiveBalance,
       });
 
       actualEndPrev = actualEnd;
     }
 
     return scheduleData;
-  }, [state.initialBalance, state.tradingDays, state.baseRate, state.deposits]);
+  }, [
+    state.initialBalance,
+    state.tradingDays,
+    state.baseRate,
+    state.deposits,
+    state.startDate,
+    liveBalanceOverride?.day,
+    liveBalanceOverride?.balance,
+  ]);
 
   const currentDayData = useMemo(() => {
     return schedule.find((d) => d.day === state.currentDay) || schedule[0];
@@ -177,5 +278,8 @@ export function useCalculator(initialState?: Partial<CalculatorState>) {
     currentDayData,
     finalTarget,
     exportToExcel,
+    autoCurrentDay,
+    isOnToday: state.currentDay === autoCurrentDay,
+    jumpToToday,
   };
 }

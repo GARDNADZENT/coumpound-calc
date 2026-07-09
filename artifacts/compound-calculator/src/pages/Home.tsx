@@ -13,9 +13,16 @@ import {
 import {
   Plus, Trash2, Download, TrendingUp, DollarSign, Calendar, Target,
   Wifi, WifiOff, RefreshCw, LogOut, Eye, EyeOff, ChevronDown, ChevronUp,
-  ArrowUpRight, ArrowDownRight,
+  ArrowUpRight, ArrowDownRight, Zap, RotateCcw,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+
+function toDateInputValue(d: Date): string {
+  const yr = d.getFullYear();
+  const mo = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${yr}-${mo}-${day}`;
+}
 
 function StatusDot({ status }: { status: string }) {
   return (
@@ -33,6 +40,9 @@ function StatusDot({ status }: { status: string }) {
 }
 
 export default function Home() {
+  const deriv = useDerivAccount();
+  const isDerivConnected = deriv.status === 'authorized';
+
   const {
     state,
     updateState,
@@ -42,9 +52,10 @@ export default function Home() {
     currentDayData,
     finalTarget,
     exportToExcel,
-  } = useCalculator();
-
-  const deriv = useDerivAccount();
+    autoCurrentDay,
+    isOnToday,
+    jumpToToday,
+  } = useCalculator(undefined, isDerivConnected ? deriv.balance : null);
 
   const [newDepositDay, setNewDepositDay] = useState('');
   const [newDepositAmount, setNewDepositAmount] = useState('');
@@ -52,8 +63,6 @@ export default function Home() {
   const [appIdInput, setAppIdInput] = useState('36544');
   const [showToken, setShowToken] = useState(false);
   const [showTrades, setShowTrades] = useState(true);
-
-  const isDerivConnected = deriv.status === 'authorized';
 
   const handleAddDeposit = () => {
     const day = parseInt(newDepositDay, 10);
@@ -83,12 +92,6 @@ export default function Home() {
       if (appIdInput) setAppIdInput('');
     }
   }
-
-  const handleSyncBalance = () => {
-    if (deriv.balance != null) {
-      updateState({ initialBalance: deriv.balance });
-    }
-  };
 
   // Progress toward today's dollar target based on Deriv P&L
   const todayTarget = currentDayData?.dollarProfitTarget ?? 0;
@@ -197,20 +200,13 @@ export default function Home() {
                         <span className="text-2xl font-mono font-bold text-foreground" data-testid="text-deriv-balance">
                           {deriv.balance != null ? formatCurrency(deriv.balance) : '—'}
                         </span>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          className="h-7 text-xs gap-1 shrink-0"
-                          onClick={handleSyncBalance}
-                          data-testid="button-sync-balance"
-                          title="Use this balance as the calculator's initial balance"
-                        >
-                          <RefreshCw size={11} />
-                          Sync
-                        </Button>
+                        <Badge variant="outline" className="h-6 text-[10px] gap-1 text-emerald-400 border-emerald-500/30 bg-emerald-500/10 shrink-0">
+                          <Zap size={10} />
+                          Auto-tracking
+                        </Badge>
                       </div>
                       <p className="text-[10px] text-muted-foreground/60 mt-1">
-                        Sync sets this as your calculator starting balance.
+                        Automatically applied to Day {autoCurrentDay}'s actual balance below — no manual sync needed.
                       </p>
                     </div>
 
@@ -381,7 +377,7 @@ export default function Home() {
                     Initial Balance ($)
                     {isDerivConnected && (
                       <span className="ml-2 text-emerald-400/70 normal-case font-normal text-[10px]">
-                        — use Sync to pull from Deriv
+                        — today's actual is auto-synced from Deriv
                       </span>
                     )}
                   </Label>
@@ -397,6 +393,23 @@ export default function Home() {
                       data-testid="input-initial-balance"
                     />
                   </div>
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="start-date" className="text-xs text-muted-foreground uppercase tracking-wider">
+                    Cycle Start Date (Day 1)
+                  </Label>
+                  <Input
+                    id="start-date"
+                    type="date"
+                    className="font-mono bg-background/50"
+                    value={toDateInputValue(state.startDate)}
+                    onChange={(e) => {
+                      if (!e.target.value) return;
+                      const [y, m, d] = e.target.value.split('-').map(Number);
+                      updateState({ startDate: new Date(y, m - 1, d) });
+                    }}
+                    data-testid="input-start-date"
+                  />
                 </div>
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
@@ -522,6 +535,19 @@ export default function Home() {
                   )}
                 </div>
                 <div className="flex items-center gap-2">
+                  {!isOnToday && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-8 text-xs gap-1.5 text-muted-foreground"
+                      onClick={jumpToToday}
+                      data-testid="button-jump-to-today"
+                      title={`Today is Day ${autoCurrentDay}`}
+                    >
+                      <RotateCcw size={12} />
+                      Jump to today (Day {autoCurrentDay})
+                    </Button>
+                  )}
                   <Label htmlFor="current-day" className="text-sm text-muted-foreground">Current Day:</Label>
                   <Input
                     id="current-day"
@@ -533,15 +559,30 @@ export default function Home() {
                     onChange={(e) => updateState({ currentDay: parseInt(e.target.value, 10) || 1 })}
                     data-testid="input-current-day"
                   />
+                  {isOnToday && (
+                    <Badge variant="outline" className="h-6 text-[10px] gap-1 text-primary border-primary/30 bg-primary/10">
+                      <Zap size={10} />
+                      Auto
+                    </Badge>
+                  )}
                 </div>
               </div>
 
               {currentDayData && (
                 <div className="grid grid-cols-2 md:grid-cols-3 gap-3 md:gap-4">
-                  <Card className="bg-card/40 border-border/40">
+                  <Card className={cn(
+                    'bg-card/40 border-border/40',
+                    currentDayData.isLiveBalance && 'border-emerald-500/30 bg-emerald-500/5',
+                  )}>
                     <CardContent className="p-4 flex flex-col justify-center">
-                      <span className="text-xs text-muted-foreground font-medium uppercase tracking-wider mb-1">Start Balance</span>
-                      <span className="text-xl font-mono font-semibold" data-testid="text-today-start">
+                      <span className="text-xs text-muted-foreground font-medium uppercase tracking-wider mb-1 flex items-center gap-1">
+                        Start Balance
+                        {currentDayData.isLiveBalance && <Wifi size={10} className="text-emerald-400" />}
+                      </span>
+                      <span className={cn(
+                        'text-xl font-mono font-semibold',
+                        currentDayData.isLiveBalance && 'text-emerald-400',
+                      )} data-testid="text-today-start">
                         {formatCurrency(currentDayData.startBalance)}
                       </span>
                     </CardContent>
@@ -700,7 +741,14 @@ export default function Home() {
                             )}
                             <span className={cn(isCurrentDay ? 'text-primary font-bold' : 'text-muted-foreground')}>{row.day}</span>
                           </TableCell>
-                          <TableCell className="text-right font-mono text-sm">{formatCurrency(row.startBalance)}</TableCell>
+                          <TableCell className="text-right font-mono text-sm">
+                            <span className={cn(row.isLiveBalance && 'text-emerald-400 font-semibold')}>
+                              {formatCurrency(row.startBalance)}
+                            </span>
+                            {row.isLiveBalance && (
+                              <Wifi size={10} className="inline-block ml-1.5 text-emerald-400 -translate-y-0.5" />
+                            )}
+                          </TableCell>
                           <TableCell className="text-right font-mono text-sm">
                             {hasDeposit ? (
                               <span className="text-emerald-400 inline-flex items-center gap-1 font-medium bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">
