@@ -19,6 +19,7 @@ import {
 } from '@/components/ui/table';
 import {
   Download, TrendingUp, Calendar, Target,
+  ChartPie, Activity,
   Wifi, WifiOff, RefreshCw, LogOut, ChevronDown, ChevronUp,
   ArrowUpRight, ArrowDownRight, Zap, RotateCcw,
 } from 'lucide-react';
@@ -459,6 +460,69 @@ export default function Home() {
                       data-testid="input-base-rate"
                     />
                   </div>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Contract Types */}
+            <Card className="border-border/50 shadow-sm bg-card/50 backdrop-blur-sm">
+              <div className="flex flex-col space-y-1.5 p-6 pb-3">
+                <h3 className="font-bold tracking-tight bg-gradient-to-r from-gray-900 via-gray-800 to-gray-900 dark:from-white dark:via-gray-100 dark:to-white bg-clip-text text-transparent flex items-center gap-2 text-lg">
+                  <ChartPie className="h-5 w-5 text-cyan-500" />
+                  Contract types
+                </h3>
+              </div>
+              <CardContent className="p-6 space-y-4">
+                {(() => {
+                  const typeCounts: Record<string, number> = {};
+                  const typeWins: Record<string, number> = {};
+                  let totalCount = 0;
+                  let totalWins = 0;
+                  for (const t of deriv.recentTrades) {
+                    if (!t.contract_type) continue;
+                    const ct = t.contract_type.toUpperCase();
+                    typeCounts[ct] = (typeCounts[ct] || 0) + 1;
+                    totalCount += 1;
+                    if ((t.profit ?? 0) > 0) {
+                      typeWins[ct] = (typeWins[ct] || 0) + 1;
+                      totalWins += 1;
+                    }
+                  }
+                  const sorted = Object.entries(typeCounts).sort((a, b) => b[1] - a[1]);
+                  if (sorted.length === 0) {
+                    return <p className="text-xs text-muted-foreground">No closed trades analyzed yet.</p>;
+                  }
+                  return (
+                    <div className="space-y-3">
+                      {sorted.map(([type, count]) => {
+                        const pct = (count / totalCount) * 100;
+                        const wins = typeWins[type] || 0;
+                        const winRate = (wins / count) * 100;
+                        return (
+                          <div key={type} className="space-y-1">
+                            <div className="flex justify-between items-center text-sm">
+                              <span className="font-medium font-mono">{type}</span>
+                              <span className="text-muted-foreground text-xs">{count} trades · {winRate.toFixed(0)}% win rate</span>
+                            </div>
+                            <div className="h-1.5 bg-muted/40 rounded-full overflow-hidden">
+                              <div className="h-full bg-primary rounded-full transition-all duration-500" style={{ width: Math.min(pct, 100) + '%' }} />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                })()}
+
+                <div className="mt-4 rounded-xl border border-border/50 bg-card/50 p-4">
+                  <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Overall Win Rate</p>
+                  <p className="mt-1 text-2xl font-bold text-foreground">
+                    {(() => {
+                      const wins = deriv.recentTrades.filter(t => (t.profit ?? 0) > 0).length;
+                      const total = deriv.recentTrades.filter(t => Number.isFinite(t.profit)).length;
+                      return total > 0 ? ((wins / total) * 100).toFixed(1) + '%' : '0.0%';
+                    })()}
+                  </p>
                 </div>
               </CardContent>
             </Card>
