@@ -12,9 +12,13 @@ export interface DayData {
   date: Date;
   deposit: number;
   startBalance: number;
+  expectedStartBalance: number;
   dollarProfitTarget: number;
   requiredPct: number;
   endBalance: number;
+  actualStartBalance?: number;
+  actualEndBalance?: number;
+  totalDeficitAdvantage?: number;
   isLiveBalance: boolean;
 }
 
@@ -50,10 +54,10 @@ const DEFAULT_START_DATE = new Date(2026, 6, 1); // July 1, 2026
 
 export function useCalculator(
   initialState?: Partial<CalculatorState>,
-  /** Live Deriv account balance, if connected. Automatically rebase today's
-   *  actual starting balance onto this real figure instead of the theoretical
-   *  compounding chain, so the schedule reflects real progress. */
   liveBalance?: number | null,
+  /** Daily trade P&L grouped by calendar date YYYY-MM-DD, used to reconstruct
+   *  actual end-of-day balances from the 1st of the month through today. */
+  tradesByCalendarDate?: Record<string, number> | null,
 ) {
   const [state, setState] = useState<CalculatorState>(() => {
     const startDate = initialState?.startDate ?? DEFAULT_START_DATE;
@@ -156,59 +160,101 @@ export function useCalculator(
 
     // Group deposits by day for easy lookup
     const depositsByDay = deposits.reduce((acc, dep) => {
-      acc[dep.day] = (acc[dep.day] || 0) + dep.amount;
+      acc[dep.day] = (dep.amount || 0);
       return acc;
     }, {} as Record<number, number>);
 
     const scheduleData: DayData[] = [];
     const cycleStart = startOfDay(startDate);
 
-    let actualEndPrev = 0;
+    // Reconstruct actual balances from trade P&L history (keyed by date string)
+    const dailyPnL = tradesByCalendarDate || {};
+
+    // Build the expected compounding schedule first
+    let expectedPrevEnd = initialBalance;
+    const expectedStarts: number[] = [];
+    const expectedEnds: number[] = [];
+    const expectedProfits: number[] = [];
 
     for (let i = 1; i <= tradingDays; i++) {
-      // 1. Calculate original target (the ideal compounding curve)
-      const originalStart = initialBalance * Math.pow(1 + rateDecimal, i - 1);
-      const originalDollarProfit = originalStart * rateDecimal;
-
-      // 2. Calculate actuals
       const depositToday = depositsByDay[i] || 0;
+      const expectedStart = expectedPrevEnd + depositToday;
+      const expectedProfit = expectedStart * rateDecimal;
+      const expectedEnd = expectedStart + expectedProfit;
 
-      let actualStart;
-      if (i === 1) {
-        actualStart = initialBalance + depositToday;
-      } else {
-        actualStart = actualEndPrev + depositToday;
-      }
+      expectedStarts.push(expectedStart);
+      expectedEnds.push(expectedEnd);
+      expectedProfits.push(expectedProfit);
 
-      // Rebase today's actual starting point on the live Deriv balance, so the
-      // rest of the schedule reflects real progress instead of the theoretical
-      // curve. Past days are left as originally projected (no historical feed).
-      // A deposit logged for today is treated as planned/not-yet-reflected in
-      // the live account, so it's added on top rather than discarded.
-      let isLiveBalance = false;
-      if (liveBalanceOverride && liveBalanceOverride.day === i) {
-        actualStart = liveBalanceOverride.balance + depositToday;
-        isLiveBalance = true;
-      }
+      expectedPrevEnd = expectedEnd;
+    }
 
-      const requiredPct = actualStart > 0 ? (originalDollarProfit / actualStart) * 100 : 0;
-      const actualEnd = actualStart + originalDollarProfit;
+    // Reconstruct actual balance history by walking the trade P&L chain
+    let actualBalance = initialBalance;
+    const actualEnds: (number | undefined)[] = new Array(tradingDays).fill(undefined);
+
+    for (let i = 0; i < tradingDays; i++) {
+      const dayNum = i + 1;
+      const depositToday = depositsByDay[dayNum] || 0;
+      actualBalance += depositToday;
 
       const currentDayDate = new Date(cycleStart);
-      currentDayDate.setDate(cycleStart.getDate() + (i - 1));
+      currentDayDate.setDate(cycleStart.getDate() + i);
+      const dateKey = `${currentDayDate.getFullYear()}-${String(currentDayDate.getMonth() + 1).padStart(2, '0')}-${String(currentDayDate.getDate()).padStart(2, '0')}`;
+      const dayPnL = dailyPnL[dateKey];
+
+      if (dayPnL != null && Number.isFinite(dayPnL)) {
+        actualBalance += dayPnL;
+        actualEnds[i] = actualBalance;
+      }
+
+      // If no trade data for this day, actual end = undefined (will fall back to expected)
+      // unless it's today with live balance override
+    }
+
+    // Override today's actual end with live Derive balance if available
+    if (liveBalanceOverride) {
+      const todayIdx = liveBalanceOverride.day - 1;
+      actualEnds[todayIdx] = liveBalanceOverride.balance;
+      // Also recalculate actual start for today from live balance - today's P&L
+      const todayPnL = dailyPnL[(() => {
+        const d = new Date(cycleStart);
+        d.setDate(cycleStart.getDate() + todayIdx);
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      })()] || 0;
+      actualBalance = liveBalanceOverride.balance - todayPnL;
+    }
+
+    // Build schedule rows with both expected and actual balances
+    for (let i = 0; i < tradingDays; i++) {
+      const dayNum = i + 1;
+      const depositToday = depositsByDay[dayNum] || 0;
+      const currentDayDate = new Date(cycleStart);
+      currentDayDate.setDate(cycleStart.getDate() + i);
+
+      const expectedStart = expectedStarts[i];
+      const expectedEnd = expectedEnds[i];
+      const actualEnd = actualEnds[i];
+      const actualStart = actualEnd != null && Number.isFinite(actualEnd) ? expectedStart : undefined;
+
+      const totalDeficitAdvantage = actualEnd != null && Number.isFinite(expectedEnd)
+        ? actualEnd - expectedEnd
+        : undefined;
 
       scheduleData.push({
-        day: i,
+        day: dayNum,
         date: currentDayDate,
         deposit: depositToday,
-        startBalance: actualStart,
-        dollarProfitTarget: originalDollarProfit,
-        requiredPct,
-        endBalance: actualEnd,
-        isLiveBalance,
+        startBalance: expectedStart,
+        expectedStartBalance: expectedStart,
+        dollarProfitTarget: expectedProfits[i],
+        requiredPct: expectedStart > 0 ? (expectedProfits[i] / expectedStart) * 100 : 0,
+        endBalance: expectedEnd,
+        actualStartBalance: actualStart,
+        actualEndBalance: actualEnd,
+        totalDeficitAdvantage,
+        isLiveBalance: false,
       });
-
-      actualEndPrev = actualEnd;
     }
 
     return scheduleData;
@@ -218,6 +264,7 @@ export function useCalculator(
     state.baseRate,
     state.deposits,
     state.startDate,
+    tradesByCalendarDate,
     liveBalanceOverride?.day,
     liveBalanceOverride?.balance,
   ]);
@@ -232,20 +279,21 @@ export function useCalculator(
     const exportData = schedule.map((row) => ({
       Day: row.day,
       Date: row.date.toLocaleDateString(),
-      'Start Balance': Number(row.startBalance.toFixed(2)),
-      'Deposit': Number(row.deposit.toFixed(2)),
-      'Dollar Profit Target': Number(row.dollarProfitTarget.toFixed(2)),
-      'Required %': row.requiredPct / 100, // numeric fraction for Excel percent formatting
+      'Expected Start': Number(row.expectedStartBalance.toFixed(2)),
+      'Profit Target': Number(row.dollarProfitTarget.toFixed(2)),
+      'Required %': row.requiredPct / 100,
       'End Balance': Number(row.endBalance.toFixed(2)),
+      'Actual Balance': row.actualEndBalance != null ? Number(row.actualEndBalance.toFixed(2)) : undefined,
+      'Total Deficit/Advantage': row.totalDeficitAdvantage != null ? Number(row.totalDeficitAdvantage.toFixed(2)) : undefined,
     }));
 
     const worksheet = XLSX.utils.json_to_sheet(exportData);
     const workbook = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(workbook, worksheet, 'Compound Schedule');
 
-    // Apply percent number format to the Required % column (column F, index 5)
+    // Apply percent number format to the Required % column
     const range = XLSX.utils.decode_range(worksheet['!ref'] || 'A1');
-    const pctColIdx = 5; // 0-based: Day=0, Date=1, StartBal=2, Deposit=3, Profit=4, Req%=5, End=6
+    const pctColIdx = 4; // 0-based: Day=0, Date=1, ExpectedStart=2, ProfitTarget=3, Req%=4
     for (let r = range.s.r + 1; r <= range.e.r; r++) {
       const cellAddr = XLSX.utils.encode_cell({ r, c: pctColIdx });
       if (worksheet[cellAddr]) {

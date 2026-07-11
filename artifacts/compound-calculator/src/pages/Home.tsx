@@ -1,18 +1,25 @@
-import { useState, useRef } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useCalculator } from '@/hooks/use-calculator';
 import { useDerivAccount } from '@/hooks/use-deriv-account';
-import { formatCurrency, formatPercentage } from '@/lib/utils';
+import { formatCurrency, formatPercentage, loadTargetHits, markTargetHit, getTargetHit, setTargetHitAccountId, type TargetHitMap } from '@/lib/utils';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from '@/components/ui/table';
 import {
-  Plus, Trash2, Download, TrendingUp, DollarSign, Calendar, Target,
-  Wifi, WifiOff, RefreshCw, LogOut, Eye, EyeOff, ChevronDown, ChevronUp,
+  Download, TrendingUp, Calendar, Target,
+  Wifi, WifiOff, RefreshCw, LogOut, ChevronDown, ChevronUp,
   ArrowUpRight, ArrowDownRight, Zap, RotateCcw,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -46,8 +53,6 @@ export default function Home() {
   const {
     state,
     updateState,
-    addDeposit,
-    removeDeposit,
     schedule,
     currentDayData,
     finalTarget,
@@ -55,48 +60,90 @@ export default function Home() {
     autoCurrentDay,
     isOnToday,
     jumpToToday,
-  } = useCalculator(undefined, isDerivConnected ? deriv.balance : null);
+  } = useCalculator(undefined, isDerivConnected ? deriv.balance : null, deriv.tradesByCalendarDate);
 
-  const [newDepositDay, setNewDepositDay] = useState('');
-  const [newDepositAmount, setNewDepositAmount] = useState('');
-  const [tokenInput, setTokenInput] = useState('');
-  const [appIdInput, setAppIdInput] = useState('36544');
-  const [showToken, setShowToken] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(() => {
+    if (typeof window === 'undefined') return null;
+    const params = new URLSearchParams(window.location.search);
+    const err = params.get('auth_error');
+    if (err) {
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+    return err;
+  });
+
   const [showTrades, setShowTrades] = useState(true);
 
-  const handleAddDeposit = () => {
-    const day = parseInt(newDepositDay, 10);
-    const amount = parseFloat(newDepositAmount);
-    if (day > 0 && day <= state.tradingDays && amount > 0) {
-      addDeposit(day, amount);
-      setNewDepositDay('');
-      setNewDepositAmount('');
-    }
+  const handleLoginDeriv = () => {
+    window.location.href = '/api/auth/login';
   };
-
-  const handleConnectDeriv = () => {
-    const t = tokenInput.trim();
-    const a = appIdInput.trim();
-    if (!t || !a) return;
-    // Keep inputs visible so the user can retry on failure.
-    // Cleared below once status flips to 'authorized'.
-    deriv.connect(t, a);
-  };
-
-  // Clear inputs once successfully authorized.
-  const prevStatus = useRef(deriv.status);
-  if (prevStatus.current !== deriv.status) {
-    prevStatus.current = deriv.status;
-    if (deriv.status === 'authorized') {
-      if (tokenInput) setTokenInput('');
-      if (appIdInput) setAppIdInput('');
-    }
-  }
 
   // Progress toward today's dollar target based on Deriv P&L
   const todayTarget = currentDayData?.dollarProfitTarget ?? 0;
   const todayProgress = isDerivConnected ? Math.min(deriv.todayPnL.totalProfit, todayTarget) : 0;
   const progressPct = todayTarget > 0 ? Math.max(0, Math.min(100, (todayProgress / todayTarget) * 100)) : 0;
+  const isTargetHitLive = isDerivConnected && todayTarget > 0 && deriv.todayPnL.totalProfit >= todayTarget;
+
+  const preTradeBalance = useMemo(() => {
+    if (!isDerivConnected || deriv.balance == null) return 2;
+    const pnl = deriv.todayPnL.totalProfit;
+    if (!Number.isFinite(pnl)) return deriv.balance;
+    return deriv.balance - pnl;
+  }, [isDerivConnected, deriv.balance, deriv.todayPnL.totalProfit]);
+
+  const projectedEndBalance = useMemo(() => {
+    return preTradeBalance + todayTarget;
+  }, [preTradeBalance, todayTarget]);
+
+  const balanceDelta = useMemo(() => {
+    if (!isDerivConnected || !currentDayData) return null;
+    // Actual pre-trade balance vs the schedule-projected expected start (no live override).
+    const expectedStart = currentDayData.expectedStartBalance;
+    if (!Number.isFinite(expectedStart)) return null;
+    return preTradeBalance - expectedStart;
+  }, [isDerivConnected, preTradeBalance, currentDayData]);
+
+  const endBalanceDelta = useMemo(() => {
+    if (!isDerivConnected || deriv.balance == null) return null;
+    return deriv.balance - projectedEndBalance;
+  }, [isDerivConnected, deriv.balance, projectedEndBalance]);
+
+  const totalAdvantage = useMemo(() => {
+    if (balanceDelta === null || endBalanceDelta === null) return null;
+    return balanceDelta + endBalanceDelta;
+  }, [balanceDelta, endBalanceDelta]);
+
+  const currentLoginId = deriv.accountInfo?.loginid ?? null;
+
+  // Load persisted target-hit map scoped to the current Deriv account so
+  // "Congratulations" badges don't leak across logins.
+  const [targetHits, setTargetHits] = useState<TargetHitMap>(() => loadTargetHits(currentLoginId));
+
+  // When the connected Deriv account changes, discard the old account's
+  // target-hit badge and reload the map for the new loginid.
+  useEffect(() => {
+    setTargetHits(loadTargetHits(currentLoginId));
+  }, [currentLoginId]);
+
+  // When the Deriv live P&L first reaches the daily target, record it permanently.
+  useEffect(() => {
+    if (
+      isTargetHitLive &&
+      currentDayData &&
+      !getTargetHit(currentDayData.date, currentLoginId) &&
+      currentDayData.day > 0
+    ) {
+      const updated = markTargetHit(currentDayData.date, currentDayData.day, deriv.todayPnL.totalProfit, currentLoginId);
+      setTargetHits(updated);
+    }
+  }, [isTargetHitLive, currentDayData, deriv.todayPnL.totalProfit, currentLoginId]);
+
+  // Merged hit check: live hit OR previously persisted hit for THIS account.
+  const isTargetHit = useMemo(() => {
+    if (!currentDayData) return false;
+    if (isTargetHitLive) return true;
+    return Boolean(getTargetHit(currentDayData.date, currentLoginId));
+  }, [isTargetHitLive, currentDayData, targetHits, currentLoginId]);
 
   const formatTradeSymbol = (shortcode: string) => {
     const parts = shortcode?.split('_') ?? [];
@@ -190,6 +237,33 @@ export default function Home() {
                       </div>
                     </div>
 
+                    {/* Account switcher */}
+                    {deriv.accounts.length > 1 && (
+                      <div className="space-y-1">
+                        <Label className="text-[10px] text-muted-foreground uppercase tracking-wider">Switch Account</Label>
+                        <Select
+                          value={deriv.selectedAccountId ?? undefined}
+                          onValueChange={(val) => deriv.switchAccount(val)}
+                        >
+                          <SelectTrigger className="h-8 text-xs">
+                            <SelectValue placeholder="Select account" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {deriv.accounts.map((acc) => (
+                              <SelectItem key={acc.account_id} value={acc.account_id} className="text-xs">
+                                <div className="flex items-center gap-2">
+                                  <span className="font-mono">{acc.account_id}</span>
+                                  <span className="text-muted-foreground text-[10px]">
+                                    {acc.currency} · {acc.account_type === 'real' ? 'Real' : 'Demo'}
+                                  </span>
+                                </div>
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    )}
+
                     {/* Live balance */}
                     <div className="rounded-md border border-border/40 bg-background/50 p-3">
                       <div className="flex items-center justify-between mb-1">
@@ -242,42 +316,43 @@ export default function Home() {
                         <span className="text-emerald-400/80">{deriv.todayPnL.wins}W</span>
                         <span className="text-red-400/80">{deriv.todayPnL.losses}L</span>
                       </div>
+                      {deriv.tradeError && (
+                        <div className="rounded-md border border-amber-500/20 bg-amber-500/5 p-2 text-[10px] text-amber-400 flex items-start gap-1.5">
+                          <span className="shrink-0 mt-0.5">⚠</span>
+                          <span>{deriv.tradeError}</span>
+                        </div>
+                      )}
                     </div>
 
                     <Button
                       variant="ghost"
                       size="sm"
                       className="w-full text-xs text-muted-foreground hover:text-destructive hover:bg-destructive/10 gap-1.5"
-                      onClick={deriv.disconnect}
+                      onClick={deriv.logout}
                       data-testid="button-disconnect-deriv"
                     >
                       <LogOut size={12} />
-                      Disconnect &amp; clear token
+                      Log out of Deriv
                     </Button>
                   </div>
                 ) : (
                   /* Disconnected / error state */
                   <div className="space-y-3">
-                    {deriv.status === 'error' && deriv.error ? (
+                    {authError ? (
+                      <div className="rounded-md border border-red-500/20 bg-red-500/5 p-3 text-xs text-red-400 flex items-start gap-2">
+                        <span className="shrink-0 mt-0.5">✕</span>
+                        <span>
+                          <span className="font-medium block mb-0.5">Deriv login failed</span>
+                          {authError}
+                        </span>
+                      </div>
+                    ) : deriv.status === 'error' && deriv.error ? (
                       <div className="rounded-md border border-red-500/20 bg-red-500/5 p-3 text-xs text-red-400 flex items-start gap-2">
                         <span className="shrink-0 mt-0.5">✕</span>
                         <span>
                           <span className="font-medium block mb-0.5">Connection failed</span>
                           {deriv.error}
-                          {deriv.savedPat && (
-                            <button
-                              className="block mt-1 underline text-muted-foreground hover:text-foreground"
-                              onClick={deriv.clearSavedCredentials}
-                            >
-                              Clear saved credentials
-                            </button>
-                          )}
                         </span>
-                      </div>
-                    ) : deriv.savedPat && deriv.status === 'connecting' ? (
-                      <div className="rounded-md border border-border/30 bg-muted/20 p-3 text-xs text-muted-foreground flex items-center gap-2">
-                        <RefreshCw size={12} className="animate-spin shrink-0" />
-                        Reconnecting with saved credentials…
                       </div>
                     ) : null}
 
@@ -288,76 +363,26 @@ export default function Home() {
                       </div>
                     ) : (
                       <div className="space-y-3">
-                        {/* PAT Token */}
-                        <div className="space-y-1.5">
-                          <Label htmlFor="deriv-token" className="text-xs text-muted-foreground uppercase tracking-wider">
-                            Personal Access Token
-                          </Label>
-                          <div className="relative">
-                            <Input
-                              id="deriv-token"
-                              type={showToken ? 'text' : 'password'}
-                              placeholder="pat_xxxxxxxxxxxxxxxx…"
-                              className="pr-10 font-mono text-sm bg-background/50"
-                              value={tokenInput}
-                              onChange={(e) => setTokenInput(e.target.value)}
-                              onKeyDown={(e) => { if (e.key === 'Enter') handleConnectDeriv(); }}
-                              data-testid="input-deriv-token"
-                            />
-                            <button
-                              type="button"
-                              className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-                              onClick={() => setShowToken((v) => !v)}
-                              tabIndex={-1}
-                            >
-                              {showToken ? <EyeOff size={14} /> : <Eye size={14} />}
-                            </button>
-                          </div>
-                          <p className="text-[10px] text-muted-foreground/50">
-                            From{' '}
-                            <a href="https://home.deriv.com/dashboard/api-tokens" target="_blank" rel="noopener noreferrer" className="underline hover:text-muted-foreground">
-                              home.deriv.com → API Tokens
-                            </a>
-                            {' '}— select <strong>Trade</strong> scope.
-                          </p>
-                        </div>
-
-                        {/* App ID */}
-                        <div className="space-y-1.5">
-                          <Label htmlFor="deriv-app-id" className="text-xs text-muted-foreground uppercase tracking-wider">
-                            App ID
-                          </Label>
-                          <Input
-                            id="deriv-app-id"
-                            type="text"
-                            placeholder="e.g. a1b2c3d4"
-                            className="font-mono text-sm bg-background/50"
-                            value={appIdInput}
-                            onChange={(e) => setAppIdInput(e.target.value)}
-                            onKeyDown={(e) => { if (e.key === 'Enter') handleConnectDeriv(); }}
-                            data-testid="input-deriv-app-id"
-                          />
-                          <p className="text-[10px] text-muted-foreground/50">
-                            <strong>36544</strong> is Deriv's public demo ID — works for testing.
-                            For production, register your own at{' '}
-                            <a href="https://developers.deriv.com" target="_blank" rel="noopener noreferrer" className="underline hover:text-muted-foreground">
-                              developers.deriv.com
-                            </a>.
-                          </p>
-                        </div>
-
                         <Button
                           className="w-full gap-2 text-sm"
-                          onClick={handleConnectDeriv}
-                          disabled={!tokenInput.trim() || !appIdInput.trim()}
+                          onClick={handleLoginDeriv}
+                          disabled={!deriv.authChecked || (deriv.config ? !deriv.config.configured : false)}
                           data-testid="button-connect-deriv"
                         >
                           <Wifi size={14} />
-                          Connect to Deriv
+                          Login with Deriv
                         </Button>
-                        <p className="text-[10px] text-muted-foreground/40 leading-relaxed">
-                          Credentials are saved locally in your browser only.
+                        <p className="text-[10px] text-muted-foreground/50 leading-relaxed">
+                          You'll be redirected to Deriv to sign in and grant access. Your session
+                          stays signed in until you log out.
                         </p>
+                        {deriv.config && !deriv.config.configured && (
+                          <p className="text-[10px] text-amber-400/80 leading-relaxed">
+                            OAuth is not configured on the server yet (missing{' '}
+                            <code className="font-mono">DERIV_OAUTH_APP_ID</code>). Add your Deriv
+                            OAuth app ID and restart.
+                          </p>
+                        )}
                       </div>
                     )}
                   </div>
@@ -375,19 +400,15 @@ export default function Home() {
                 <div className="space-y-2">
                   <Label htmlFor="initial-balance" className="text-xs text-muted-foreground uppercase tracking-wider">
                     Initial Balance ($)
-                    {isDerivConnected && (
-                      <span className="ml-2 text-emerald-400/70 normal-case font-normal text-[10px]">
-                        — today's actual is auto-synced from Deriv
-                      </span>
-                    )}
                   </Label>
                   <div className="relative">
-                    <DollarSign className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground h-4 w-4" />
+                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground text-sm">$</span>
                     <Input
                       id="initial-balance"
                       type="number"
                       min="0"
-                      className="pl-9 font-mono bg-background/50"
+                      step="0.01"
+                      className="pl-7 font-mono bg-background/50"
                       value={state.initialBalance || ''}
                       onChange={(e) => updateState({ initialBalance: parseFloat(e.target.value) || 0 })}
                       data-testid="input-initial-balance"
@@ -441,83 +462,9 @@ export default function Home() {
                 </div>
               </CardContent>
             </Card>
-
-            {/* Mid-Cycle Deposits */}
-            <Card className="border-border/50 shadow-sm bg-card/50 backdrop-blur-sm">
-              <CardHeader className="pb-4">
-                <CardTitle className="text-lg">Mid-Cycle Deposits</CardTitle>
-                <CardDescription>Add capital to reduce required percentage.</CardDescription>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                <div className="flex gap-2 items-end">
-                  <div className="space-y-2 flex-1">
-                    <Label htmlFor="deposit-day" className="text-xs text-muted-foreground uppercase tracking-wider">Day #</Label>
-                    <Input
-                      id="deposit-day"
-                      type="number"
-                      min="1"
-                      max={state.tradingDays}
-                      placeholder="e.g. 15"
-                      className="font-mono bg-background/50"
-                      value={newDepositDay}
-                      onChange={(e) => setNewDepositDay(e.target.value)}
-                      data-testid="input-deposit-day"
-                    />
-                  </div>
-                  <div className="space-y-2 flex-1">
-                    <Label htmlFor="deposit-amount" className="text-xs text-muted-foreground uppercase tracking-wider">Amount ($)</Label>
-                    <Input
-                      id="deposit-amount"
-                      type="number"
-                      min="0"
-                      placeholder="e.g. 500"
-                      className="font-mono bg-background/50"
-                      value={newDepositAmount}
-                      onChange={(e) => setNewDepositAmount(e.target.value)}
-                      data-testid="input-deposit-amount"
-                    />
-                  </div>
-                  <Button
-                    onClick={handleAddDeposit}
-                    disabled={!newDepositDay || !newDepositAmount}
-                    size="icon"
-                    className="shrink-0"
-                    data-testid="button-add-deposit"
-                  >
-                    <Plus size={16} />
-                  </Button>
-                </div>
-                {state.deposits.length > 0 && (
-                  <div className="border border-border rounded-md overflow-hidden">
-                    <div className="bg-muted/30 px-3 py-2 border-b border-border flex justify-between items-center text-xs font-medium text-muted-foreground">
-                      <span>Day</span>
-                      <span>Amount</span>
-                      <span className="w-8" />
-                    </div>
-                    <ul className="divide-y divide-border/50 max-h-[200px] overflow-auto">
-                      {state.deposits.map((dep) => (
-                        <li key={dep.id} className="flex justify-between items-center px-3 py-2 text-sm bg-background/50 hover:bg-muted/30 transition-colors">
-                          <span className="font-mono">Day {dep.day}</span>
-                          <span className="font-mono text-emerald-400">{formatCurrency(dep.amount)}</span>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-6 w-6 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
-                            onClick={() => removeDeposit(dep.id)}
-                            data-testid={`button-remove-deposit-${dep.id}`}
-                          >
-                            <Trash2 size={14} />
-                          </Button>
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-              </CardContent>
-            </Card>
           </div>
 
-          {/* RIGHT PANEL */}
+            {/* RIGHT PANEL */}
           <div className="lg:col-span-8 space-y-6">
 
             {/* Dashboard */}
@@ -577,26 +524,69 @@ export default function Home() {
                     <CardContent className="p-4 flex flex-col justify-center">
                       <span className="text-xs text-muted-foreground font-medium uppercase tracking-wider mb-1 flex items-center gap-1">
                         Start Balance
-                        {currentDayData.isLiveBalance && <Wifi size={10} className="text-emerald-400" />}
+                        {isDerivConnected && <Wifi size={10} className="text-emerald-400" />}
                       </span>
                       <span className={cn(
                         'text-xl font-mono font-semibold',
-                        currentDayData.isLiveBalance && 'text-emerald-400',
+                        isDerivConnected && 'text-emerald-400',
                       )} data-testid="text-today-start">
-                        {formatCurrency(currentDayData.startBalance)}
+                        {formatCurrency(isDerivConnected ? preTradeBalance : 2)}
                       </span>
+                      {isDerivConnected && balanceDelta !== null && (
+                        <span className={cn(
+                          'text-[10px] font-medium mt-1 flex items-center gap-1',
+                          balanceDelta > 0 ? 'text-emerald-400' : balanceDelta < 0 ? 'text-red-400' : 'text-muted-foreground',
+                        )}>
+                          {balanceDelta > 0 ? <ArrowUpRight size={10} /> : balanceDelta < 0 ? <ArrowDownRight size={10} /> : null}
+                          {balanceDelta > 0 ? '+' : ''}{formatCurrency(balanceDelta)} {balanceDelta > 0 ? 'Ahead' : balanceDelta < 0 ? 'Behind' : ''}
+                        </span>
+                      )}
+                      {totalAdvantage !== null && totalAdvantage !== 0 && (
+                        <span className={cn(
+                          'text-[10px] font-semibold mt-0.5 flex items-center gap-1',
+                          totalAdvantage > 0 ? 'text-emerald-400' : 'text-red-400',
+                        )}>
+                          {totalAdvantage > 0 ? '+' : ''}{formatCurrency(totalAdvantage)} {totalAdvantage > 0 ? 'total advantage' : 'total deficit'}
+                        </span>
+                      )}
                     </CardContent>
                   </Card>
 
-                  <Card className="bg-primary/10 border-primary/20 relative overflow-hidden">
+                  <Card className={cn(
+                    'bg-primary/10 border-primary/20 relative overflow-hidden',
+                    isTargetHit && 'border-emerald-500/40 bg-emerald-500/10',
+                  )}>
                     <div className="absolute top-0 right-0 p-2 opacity-10">
                       <Target size={40} />
                     </div>
                     <CardContent className="p-4 flex flex-col justify-center relative z-10">
-                      <span className="text-xs text-primary/80 font-medium uppercase tracking-wider mb-1">Dollar Profit</span>
-                      <span className="text-xl font-mono font-bold text-primary" data-testid="text-today-profit">
-                        {formatCurrency(currentDayData.dollarProfitTarget)}
+                      <span className="text-xs text-primary/80 font-medium uppercase tracking-wider mb-1 flex items-center gap-1">
+                        Dollar Profit
+                        {isDerivConnected && (
+                          <Wifi size={10} className="text-emerald-400" />
+                        )}
                       </span>
+                      {isDerivConnected ? (
+                        <span className="text-xl font-mono font-bold text-primary flex items-baseline gap-1" data-testid="text-today-profit">
+                          {formatCurrency(currentDayData.dollarProfitTarget)}
+                          <span className="mx-0.5 text-foreground/40">/</span>
+                          <span className={cn(
+                            'font-semibold',
+                            deriv.todayPnL.totalProfit >= 0 ? 'text-emerald-400' : 'text-red-400',
+                          )}>
+                            {deriv.todayPnL.totalProfit >= 0 ? '+' : ''}{formatCurrency(deriv.todayPnL.totalProfit)}
+                          </span>
+                        </span>
+                      ) : (
+                        <span className="text-xl font-mono font-bold text-primary" data-testid="text-today-profit">
+                          {formatCurrency(currentDayData.dollarProfitTarget)}
+                        </span>
+                      )}
+                      {isTargetHit && (
+                        <span className="text-xs text-emerald-400 font-medium mt-1 flex items-center gap-1">
+                          <TrendingUp size={12} /> Congratulations! Today's profit target hit.
+                        </span>
+                      )}
                     </CardContent>
                   </Card>
 
@@ -626,8 +616,16 @@ export default function Home() {
                     <CardContent className="p-4 flex flex-col justify-center">
                       <span className="text-xs text-muted-foreground font-medium uppercase tracking-wider mb-1">End Balance</span>
                       <span className="text-xl font-mono font-semibold" data-testid="text-today-end">
-                        {formatCurrency(currentDayData.endBalance)}
+                        {formatCurrency(projectedEndBalance)}
                       </span>
+                      {endBalanceDelta !== null && endBalanceDelta !== 0 && isDerivConnected && (
+                        <span className={cn(
+                          'text-[10px] font-medium mt-1 flex items-center gap-1',
+                          endBalanceDelta > 0 ? 'text-emerald-400' : 'text-red-400',
+                        )}>
+                          {endBalanceDelta > 0 ? '+' : ''}{formatCurrency(endBalanceDelta)} {endBalanceDelta > 0 ? 'above target' : 'below target'}
+                        </span>
+                      )}
                     </CardContent>
                   </Card>
 
@@ -712,17 +710,17 @@ export default function Home() {
                   <TableHeader className="sticky top-0 bg-card/95 backdrop-blur z-10 shadow-sm after:absolute after:bottom-0 after:left-0 after:right-0 after:h-[1px] after:bg-border/50">
                     <TableRow className="border-none hover:bg-transparent">
                       <TableHead className="w-[60px] text-center">Day</TableHead>
-                      <TableHead className="text-right">Start Bal</TableHead>
-                      <TableHead className="text-right">Deposit</TableHead>
-                      <TableHead className="text-right">Profit Tgt</TableHead>
+                      <TableHead className="text-right">Expected Start</TableHead>
+                      <TableHead className="text-right">Profit Target</TableHead>
                       <TableHead className="text-right">Req %</TableHead>
-                      <TableHead className="text-right">End Bal</TableHead>
+                      <TableHead className="text-right">End Balance</TableHead>
+                      <TableHead className="text-right">Actual Balance</TableHead>
+                      <TableHead className="text-right">Total Deficit/Advantage</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
                     {schedule.map((row) => {
                       const isCurrentDay = row.day === state.currentDay;
-                      const hasDeposit = row.deposit > 0;
                       const reducedPct = row.requiredPct < state.baseRate;
                       return (
                         <TableRow
@@ -730,8 +728,7 @@ export default function Home() {
                           className={cn(
                             'group transition-colors',
                             isCurrentDay && 'bg-primary/5 hover:bg-primary/10 border-primary/20 relative',
-                            !isCurrentDay && hasDeposit && 'bg-emerald-500/5 hover:bg-emerald-500/10',
-                            !isCurrentDay && !hasDeposit && 'hover:bg-muted/30 border-border/40',
+                            !isCurrentDay && 'hover:bg-muted/30 border-border/40',
                           )}
                           data-testid={`row-day-${row.day}`}
                         >
@@ -742,21 +739,7 @@ export default function Home() {
                             <span className={cn(isCurrentDay ? 'text-primary font-bold' : 'text-muted-foreground')}>{row.day}</span>
                           </TableCell>
                           <TableCell className="text-right font-mono text-sm">
-                            <span className={cn(row.isLiveBalance && 'text-emerald-400 font-semibold')}>
-                              {formatCurrency(row.startBalance)}
-                            </span>
-                            {row.isLiveBalance && (
-                              <Wifi size={10} className="inline-block ml-1.5 text-emerald-400 -translate-y-0.5" />
-                            )}
-                          </TableCell>
-                          <TableCell className="text-right font-mono text-sm">
-                            {hasDeposit ? (
-                              <span className="text-emerald-400 inline-flex items-center gap-1 font-medium bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">
-                                +{formatCurrency(row.deposit)}
-                              </span>
-                            ) : (
-                              <span className="text-muted-foreground/30">-</span>
-                            )}
+                            {formatCurrency(row.expectedStartBalance)}
                           </TableCell>
                           <TableCell className="text-right font-mono text-sm text-primary/90 font-medium">
                             {formatCurrency(row.dollarProfitTarget)}
@@ -766,7 +749,28 @@ export default function Home() {
                               {formatPercentage(row.requiredPct)}
                             </span>
                           </TableCell>
-                          <TableCell className="text-right font-mono text-sm font-medium">{formatCurrency(row.endBalance)}</TableCell>
+                          <TableCell className="text-right font-mono text-sm">
+                            {formatCurrency(row.endBalance)}
+                          </TableCell>
+                          <TableCell className="text-right font-mono text-sm">
+                            {row.actualEndBalance != null ? (
+                              <span className="text-emerald-400 font-medium">{formatCurrency(row.actualEndBalance)}</span>
+                            ) : (
+                              <span className="text-muted-foreground/30">-</span>
+                            )}
+                          </TableCell>
+                          <TableCell className="text-right font-mono text-sm">
+                            {row.totalDeficitAdvantage != null ? (
+                              <span className={cn(
+                                'font-medium',
+                                row.totalDeficitAdvantage > 0 ? 'text-emerald-400' : row.totalDeficitAdvantage < 0 ? 'text-red-400' : 'text-muted-foreground',
+                              )}>
+                                {row.totalDeficitAdvantage > 0 ? '+' : ''}{formatCurrency(row.totalDeficitAdvantage)}
+                              </span>
+                            ) : (
+                              <span className="text-muted-foreground/30">-</span>
+                            )}
+                          </TableCell>
                         </TableRow>
                       );
                     })}
@@ -869,3 +873,5 @@ export default function Home() {
     </div>
   );
 }
+// cache-bust
+// v2

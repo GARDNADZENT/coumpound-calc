@@ -132,6 +132,16 @@ export class DerivAPIClient {
   >();
   private subscriptionHandlers = new Map<string, MessageHandler[]>();
   private statusHandler: ((status: ConnectionStatus) => void) | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+  // Token is provided lazily so it can be re-fetched (refreshed) on reconnect.
+  private getToken: (() => Promise<string>) | null = null;
+  private appId = '';
+
+  setAuth(getToken: () => Promise<string>, appId: string) {
+    this.getToken = getToken;
+    this.appId = appId;
+  }
 
   private get nextReqId() {
     return ++this.reqId;
@@ -147,24 +157,28 @@ export class DerivAPIClient {
 
   // ── REST: list all Options accounts ─────────────────────────────────────────
 
-  async getAccounts(patToken: string, appId: string): Promise<OptionsAccount[]> {
+  async getAccounts(): Promise<OptionsAccount[]> {
+    if (!this.getToken) throw new Error('Not authenticated');
+    const token = await this.getToken();
     const res = await restRequest<{ data: OptionsAccount[] }>(
       'GET',
       '/trading/v1/options/accounts',
-      patToken,
-      appId,
+      token,
+      this.appId,
     );
     return res.data ?? [];
   }
 
   // ── REST: get a short-lived OTP WebSocket URL ────────────────────────────────
 
-  async getOTPWebSocketUrl(patToken: string, appId: string, accountId: string): Promise<string> {
+  async getOTPWebSocketUrl(accountId: string): Promise<string> {
+    if (!this.getToken) throw new Error('Not authenticated');
+    const token = await this.getToken();
     const res = await restRequest<{ data: { url: string } }>(
       'POST',
       `/trading/v1/options/accounts/${accountId}/otp`,
-      patToken,
-      appId,
+      token,
+      this.appId,
     );
     return res.data.url;
   }
@@ -186,6 +200,7 @@ export class DerivAPIClient {
       this.ws.onopen = () => {
         settled = true;
         this.setStatus('authorized'); // OTP already authenticates — no separate authorize step
+        this.startHeartbeat();
         resolve();
       };
 
@@ -194,6 +209,7 @@ export class DerivAPIClient {
       };
 
       this.ws.onclose = (ev) => {
+        this.stopHeartbeat();
         this.setStatus('disconnected');
         const detail = ev.reason
           ? `${ev.reason} (code ${ev.code})`
@@ -280,31 +296,92 @@ export class DerivAPIClient {
 
   // ── WebSocket: profit table ────────────────────────────────────────────────────
 
-  async getProfitTable(limit = 50): Promise<DerivTrade[]> {
+  async getProfitTable(): Promise<DerivTrade[]> {
     const res = await this.send({
       profit_table: 1,
       description: 1,
-      limit,
       sort: 'DESC',
     });
-    return ((res.profit_table?.transactions as DerivTrade[]) ?? []);
+    const raw = (res.profit_table?.transactions as Array<Record<string, unknown>>) ?? [];
+    return raw.map(normalizeTrade);
   }
 
   // ── Teardown ───────────────────────────────────────────────────────────────────
 
+  private startHeartbeat() {
+    this.stopHeartbeat();
+    // Send a ping every 20s to keep the connection alive and detect dead sockets.
+    this.heartbeatTimer = setInterval(() => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        try {
+          this.ws.send(JSON.stringify({ ping: 1 }));
+        } catch {
+          // ignore — onclose will trigger reconnect
+        }
+      }
+    }, 20_000);
+  }
+
+  private stopHeartbeat() {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
   disconnect() {
+    this.stopHeartbeat();
     for (const [, p] of this.pendingRequests) {
       p.reject(new Error('Disconnected'));
     }
     this.pendingRequests.clear();
     this.subscriptionHandlers.clear();
-    if (this.ws) {
-      this.ws.onopen = null;
-      this.ws.onclose = null;
-      this.ws.onerror = null;
-      this.ws.onmessage = null;
-      this.ws.close();
-      this.ws = null;
+    try {
+      if (this.ws) this.ws.close();
+    } catch {
+      // ignore
     }
+    this.ws = null;
   }
+}
+
+// ─── Trade normalizer ─────────────────────────────────────────────────────────
+// The Deriv profit_table API sends numeric fields as strings or may leave
+// `profit` unset/null. We parse everything as numbers and derive profit from
+// buy/sell prices when it's missing.
+
+function asNum(v: unknown, fallback = 0): number {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+export function normalizeTrade(raw: Record<string, unknown>): DerivTrade {
+  const buyPrice = asNum(raw.buy_price);
+  const sellPriceRaw = raw.sell_price;
+  const sellPrice = sellPriceRaw != null ? asNum(sellPriceRaw) : NaN;
+  const profitFromApi = asNum(raw.profit, NaN);
+  const profit =
+    Number.isFinite(profitFromApi) && profitFromApi !== 0
+      ? profitFromApi
+      : Number.isFinite(sellPrice)
+        ? sellPrice - buyPrice
+        : 0;
+
+  return {
+    transaction_id: asNum(raw.transaction_id),
+    contract_id: asNum(raw.contract_id),
+    buy_price: buyPrice,
+    sell_price: Number.isFinite(sellPrice) ? sellPrice : null,
+    profit,
+    profit_percentage: asNum(raw.profit_percentage),
+    contract_type: String(raw.contract_type ?? ''),
+    shortcode: String(raw.shortcode ?? ''),
+    duration_type: String(raw.duration_type ?? ''),
+    purchase_time: asNum(raw.purchase_time),
+    sell_time: raw.sell_time != null ? asNum(raw.sell_time) : null,
+    app_id: asNum(raw.app_id),
+    underlying_symbol: String(raw.underlying_symbol ?? ''),
+    payout: asNum(raw.payout),
+    is_sold: asNum(raw.is_sold),
+  };
 }
