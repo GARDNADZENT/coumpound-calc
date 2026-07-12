@@ -241,6 +241,15 @@ export function useCalculator(
         ? actualEnd - expectedEnd
         : undefined;
 
+      const actualStartForPct = (() => {
+        const depositToday = depositsByDay[i + 1] || 0;
+        if (i === 0) return initialBalance + depositToday;
+        const prev = actualEnds[i - 1];
+        if (prev != null && Number.isFinite(prev)) return prev + depositToday;
+        return expectedStart;
+      })();
+      const requiredPct = actualStartForPct > 0 ? (expectedProfits[i] / actualStartForPct) * 100 : 0;
+
       scheduleData.push({
         day: dayNum,
         date: currentDayDate,
@@ -248,7 +257,7 @@ export function useCalculator(
         startBalance: expectedStart,
         expectedStartBalance: expectedStart,
         dollarProfitTarget: expectedProfits[i],
-        requiredPct: expectedStart > 0 ? (expectedProfits[i] / expectedStart) * 100 : 0,
+        requiredPct,
         endBalance: expectedEnd,
         actualStartBalance: actualStart,
         actualEndBalance: actualEnd,
